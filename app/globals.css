@@ -1,0 +1,29 @@
+@import "tailwindcss";
+
+/*
+ * Manabii design tokens — single source of truth for brand colour.
+ *
+ * Components must reference the generated utilities (bg-canvas, text-ink,
+ * border-line, bg-brand, text-success) rather than repeating literal hex
+ * values, so the palette can be adjusted in one place.
+ *
+ * The palette is intentionally fixed rather than inverted under
+ * `prefers-color-scheme: dark`: the brand identity is a warm ivory canvas,
+ * and the approved mark assets were contrast-checked against it.
+ */
+@theme {
+  --color-canvas: #faf8f2;
+  --color-surface: #ffffff;
+  --color-ink: #252525;
+  --color-brand: #d94a38;
+  --color-success: #4c8a7a;
+  --color-line: #eae7df;
+
+  --font-sans: var(--font-geist-sans), ui-sans-serif, system-ui, sans-serif;
+  --font-mono: var(--font-geist-mono), ui-monospace, monospace;
+}
+
+body {
+  background-color: var(--color-canvas);
+  color: var(--color-ink);
+}

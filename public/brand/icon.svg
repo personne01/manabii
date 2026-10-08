@@ -1,0 +1,31 @@
+<svg
+  xmlns="http://www.w3.org/2000/svg"
+  viewBox="0 0 40 40"
+  width="40"
+  height="40"
+  role="img"
+  aria-label="Manabii"
+>
+  <!--
+    Manabii app icon. Square plate so it can be used as a browser tab icon
+    without letterboxing; the mark is reversed out in ivory and uses only solid
+    facets, since the fold cannot resolve at 16px.
+  -->
+  <rect width="40" height="40" rx="9" fill="#D94A38" />
+  <g stroke="none" transform="translate(20 20) scale(0.88) translate(-20 -20)">
+    <!-- stem -->
+    <path fill="#FAF8F2" d="M19.45 21L20.55 21L21.25 35.4L18.75 35.4Z" />
+    <!-- base, lit half -->
+    <path fill="#FAF8F2" d="M20 30.4L26.2 35.4L20 35.4Z" />
+    <!-- base, shaded half -->
+    <path fill="#FAF8F2" d="M20 30.4L20 35.4L13.8 35.4Z" />
+    <!-- left leaf, upper facet -->
+    <path fill="#FAF8F2" d="M20 21L8 4.6L10.1 10.5Z" />
+    <!-- left leaf, lower facet -->
+    <path fill="#FAF8F2" d="M20 21L10.1 10.5L12.2 16.4Z" />
+    <!-- right leaf, upper facet -->
+    <path fill="#FAF8F2" d="M20 21L32 4.6L29.9 10.5Z" />
+    <!-- right leaf, lower facet -->
+    <path fill="#FAF8F2" d="M20 21L29.9 10.5L27.8 16.4Z" />
+  </g>
+</svg>

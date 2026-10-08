@@ -1,0 +1,513 @@
+// Manabii Prisma schema.
+//
+// Scope: the identity/authorization core (AGENTS.md section 8), the Auth.js
+// persistence tables it requires, and the JLPT learning domain (curriculum,
+// vocabulary, grammar, kanji, exercises, and the source events progress is
+// derived from).
+//
+// The Auth.js decision is settled: stable next-auth v4 (4.24.15) with
+// @next-auth/prisma-adapter 1.0.7. v5 is beta-only and is not used.
+
+generator client {
+  provider = "prisma-client"
+  output   = "../app/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// Authorization roles. Enforced server-side; never trusted from the client (AGENTS.md section 8).
+enum Role {
+  STUDENT
+  CONTENT_EDITOR
+  ADMIN
+}
+
+model User {
+  // UUIDv7 rather than v4: PostgreSQL B-tree indexes degrade badly under random
+  // key insertion, and UUID PKs are mandated by AGENTS.md section 7. UUIDv7 is
+  // time-ordered, so index pages stay dense as rows accumulate.
+  id String @id @default(uuid(7)) @db.Uuid
+
+  // 320 is the RFC 5321 maximum length for an email address.
+  email         String    @unique @db.VarChar(320)
+  emailVerified DateTime? @db.Timestamptz(3)
+
+  name  String? @db.VarChar(120)
+  image String? @db.VarChar(2048)
+
+  role Role @default(STUDENT)
+
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  // Auth.js relations. Cascade on delete keeps orphaned OAuth links and sessions
+  // from outliving the user they belong to.
+  accounts Account[]
+  sessions Session[]
+
+  // Learning history. Cascades from `User` so deleting an account cannot leave
+  // orphaned attempts or completions behind (AGENTS.md section 7).
+  attempts    ExerciseAttempt[]
+  completions LessonCompletion[]
+
+  // Supports server-side admin/editor lookups by role without a sequential scan.
+  @@index([role])
+}
+
+// The three models below follow the canonical schema shipped by
+// @next-auth/prisma-adapter 1.0.7, with three deliberate deviations:
+//
+//  1. Primary keys are `uuid(7)` rather than the adapter's suggested `cuid()`,
+//     because AGENTS.md section 7 mandates UUID primary keys. The adapter never
+//     supplies a primary key itself, so this only works because every write goes
+//     through the Prisma client, which fills `uuid(7)` client-side. The column
+//     has no database-side default, so raw SQL must supply `id` explicitly.
+//  2. `Account.userId` and `Session.userId` are annotated `@db.Uuid` instead of
+//     being bare `String`. They are foreign keys into `User.id`, which is
+//     `@db.Uuid`. A relation whose scalar has a different native type than the
+//     field it references is rejected by Prisma, so this annotation is required
+//     rather than cosmetic.
+//  3. Tokens use explicit native types (`@db.Text` / `@db.VarChar(n)`) to match
+//     the rest of this schema instead of Postgres' unbounded `text` default.
+
+// One row per linked OAuth provider account.
+model Account {
+  id String @id @default(uuid(7)) @db.Uuid
+
+  userId String @db.Uuid
+
+  // "oauth" for OAuth providers, "email" for magic links, "credentials" for the
+  // deferred password provider. Reserved by the adapter.
+  type String @db.VarChar(30)
+
+  // Provider slug, e.g. "google".
+  provider String @db.VarChar(100)
+
+  // The provider's own stable identifier for this user (Google's `sub`). The
+  // (provider, providerAccountId) pair is the adapter's lookup key.
+  providerAccountId String @db.VarChar(255)
+
+  // OAuth tokens are long and provider-defined, so unbounded text is correct here.
+  refresh_token String? @db.Text
+  access_token  String? @db.Text
+  expires_at    Int?
+  token_type    String? @db.VarChar(100)
+  scope         String? @db.Text
+  id_token      String? @db.Text
+  session_state String? @db.VarChar(255)
+
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // Required by the adapter: it resolves a sign-in via
+  // `account.findUnique({ where: { provider_providerAccountId } })`.
+  @@unique([provider, providerAccountId])
+  @@index([userId])
+}
+
+// Database-backed session. Only issued while "database" session strategy is active.
+model Session {
+  id String @id @default(uuid(7)) @db.Uuid
+
+  // Opaque token stored in the user's cookie; resolved by the adapter on every
+  // session read, so it carries a unique index.
+  sessionToken String @unique @db.VarChar(255)
+
+  userId  String   @db.Uuid
+  expires DateTime @db.Timestamptz(3)
+
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+// Single-use token for email verification and magic links.
+//
+// This model is currently unused: Google OAuth is the only configured provider,
+// so nothing creates these rows yet. It is declared because the v4 adapter
+// exposes `useVerificationToken` against this delegate, and the adapter is only
+// type-complete when the model exists. It deliberately carries no created/updated
+// timestamps: rows here are ephemeral and are deleted as soon as they are consumed.
+model VerificationToken {
+  id String @id @default(uuid(7)) @db.Uuid
+
+  // The email address being verified, or the raw token for other flows.
+  identifier String   @db.VarChar(320)
+  token      String   @unique @db.VarChar(255)
+  expires    DateTime @db.Timestamptz(3)
+
+  // Required by the adapter: `verificationToken.findUnique` / `deleteMany` use
+  // `where: { identifier_token: { identifier, token } }`.
+  @@unique([identifier, token])
+}
+
+// ---------------------------------------------------------------------------
+// JLPT learning domain
+//
+// Hierarchy: JLPTLevel -> Course -> Chapter -> Lesson -> content + exercises.
+// A Lesson draws its vocabulary, grammar and kanji from the shared content
+// tables through ordered join models, so one vocabulary entry can appear in
+// several lessons without being duplicated (AGENTS.md section 8: store the
+// Japanese expression, reading, meaning, part of speech, level and examples).
+//
+// Two rules govern everything below:
+//
+//  1. Progress is stored as append-only source events (`ExerciseAttempt`,
+//     `LessonCompletion`), never as counters on a lesson or user. Every number
+//     the dashboard shows is derived from those rows, so a score can never drift
+//     out of agreement with the attempts that produced it (AGENTS.md sections 7
+//     and 10).
+//  2. No `Json` columns. Structured values use real columns or `String[]`, which
+//     keeps every value statically typed and avoids `any` at the read site
+//     (AGENTS.md section 6).
+// ---------------------------------------------------------------------------
+
+// A JLPT band. An enum rather than a table because the set is fixed by the exam
+// itself; adding N0-style bands is a migration, and the curriculum stays
+// extensible from N5 to N1 without any structural change.
+enum JLPTLevel {
+  N5
+  N4
+  N3
+  N2
+  N1
+}
+
+// Publication state for authored content. AGENTS.md section 18 requires that
+// unfinished material is never exposed to students, so every student-facing read
+// filters on `PUBLISHED` rather than trusting a caller to remember to.
+enum ContentStatus {
+  DRAFT
+  PUBLISHED
+  ARCHIVED
+}
+
+// Exercise kinds. Only the two kinds the current engine can actually grade are
+// declared; the remaining kinds from the product brief (FILL_IN_THE_BLANK,
+// MATCHING, ORDERING, TRANSLATION, READING_COMPREHENSION,
+// LISTENING_COMPREHENSION) are added when the validator grows a branch for them,
+// so the enum can never claim support the engine does not have.
+enum ExerciseType {
+  MULTIPLE_CHOICE
+  TRUE_FALSE
+}
+
+model Course {
+  id String @id @default(uuid(7)) @db.Uuid
+
+  // Stable, URL-safe identifier so course and chapter links survive a retitle.
+  slug        String @unique @db.VarChar(80)
+  title       String @db.VarChar(120)
+  description String @db.Text
+
+  level  JLPTLevel
+  order  Int
+  status ContentStatus @default(DRAFT)
+
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  chapters Chapter[]
+
+  @@index([level, order])
+  @@index([status])
+}
+
+model Chapter {
+  id String @id @default(uuid(7)) @db.Uuid
+
+  courseId String @db.Uuid
+
+  slug        String @db.VarChar(80)
+  title       String @db.VarChar(120)
+  description String @db.Text
+
+  order  Int
+  status ContentStatus @default(DRAFT)
+
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  course  Course   @relation(fields: [courseId], references: [id], onDelete: Cascade)
+  lessons Lesson[]
+
+  // Ordering is unique within a parent so the browser can never render two
+  // chapters claiming position 1, which would make "next lesson" ambiguous.
+  @@unique([courseId, slug])
+  @@unique([courseId, order])
+}
+
+model Lesson {
+  id String @id @default(uuid(7)) @db.Uuid
+
+  chapterId String @db.Uuid
+
+  slug        String @db.VarChar(80)
+  title       String @db.VarChar(120)
+  description String @db.Text
+
+  order  Int
+  status ContentStatus @default(DRAFT)
+
+  // A planning estimate used for display only. It is never summed into a study
+  // time total, because a displayed estimate is not a measurement
+  // (AGENTS.md section 10: do not fabricate duration metrics).
+  estimatedMinutes Int @default(5)
+
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  chapter Chapter @relation(fields: [chapterId], references: [id], onDelete: Cascade)
+
+  vocabulary LessonVocabulary[]
+  grammar    LessonGrammar[]
+  kanji      LessonKanji[]
+  exercises  Exercise[]
+
+  completions LessonCompletion[]
+  attempts    ExerciseAttempt[]
+
+  @@unique([chapterId, slug])
+  @@unique([chapterId, order])
+}
+
+// A vocabulary entry (kotoba). Readings are stored explicitly rather than
+// derived, because kanji readings cannot be generated reliably from Unicode and
+// AGENTS.md section 9 forbids fabricating them.
+model Vocabulary {
+  id String @id @default(uuid(7)) @db.Uuid
+
+  // The headword as written, e.g. "食べる".
+  term         String @db.VarChar(120)
+  // Kana reading, e.g. "たべる".
+  reading      String @db.VarChar(120)
+  // English gloss.
+  meaning      String @db.VarChar(255)
+  // Part of speech, e.g. "Verb", "Noun". Free text rather than an enum because
+  // Japanese grammar has categories a fixed enum would reject.
+  partOfSpeech String @db.VarChar(60)
+
+  jlpt JLPTLevel
+
+  exampleSentence    String? @db.Text
+  exampleReading     String? @db.VarChar(400)
+  exampleTranslation String? @db.Text
+
+  // Free-form authoring labels, e.g. "food", "verb-te".
+  tags String[]
+
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  lessons LessonVocabulary[]
+
+  @@index([jlpt])
+}
+
+// A grammar point (bunpou). Register is stored separately from meaning because
+// AGENTS.md section 9 requires polite and plain forms to be distinguished.
+model Grammar {
+  id String @id @default(uuid(7)) @db.Uuid
+
+  pattern     String  @db.VarChar(120)
+  reading     String? @db.VarChar(120)
+  meaning     String  @db.VarChar(255)
+  formation   String  @db.VarChar(255)
+  explanation String? @db.Text
+  register    String  @db.VarChar(60)
+
+  exampleSentence    String  @db.Text
+  exampleReading     String? @db.VarChar(400)
+  exampleTranslation String  @db.Text
+
+  // Slugs of related patterns, used to cross-link lessons. Slugs rather than
+  // foreign keys because relatedness is editorial, not referential: a dangling
+  // slug degrades to "no related pattern" instead of blocking a delete.
+  relatedSlugs String[]
+
+  jlpt JLPTLevel
+
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  lessons LessonGrammar[]
+
+  @@index([jlpt])
+}
+
+// A kanji character. On'yomi and kun'yomi are separate arrays because they are
+// genuinely distinct readings, not two spellings of one value.
+model Kanji {
+  id String @id @default(uuid(7)) @db.Uuid
+
+  character String @db.VarChar(8)
+  meaning   String @db.VarChar(255)
+
+  onyomi  String[]
+  kunyomi String[]
+
+  // Nullable: AGENTS.md section 9 permits stroke counts only when they come from
+  // a reliable source, so an unverified character must be able to omit it.
+  strokeCount Int?
+
+  jlpt JLPTLevel
+
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  lessons LessonKanji[]
+
+  @@index([jlpt])
+}
+
+// Ordered join rows. `order` lives on the join rather than the content table
+// because the same word is taught in a different sequence in different lessons.
+model LessonVocabulary {
+  lessonId     String @db.Uuid
+  vocabularyId String @db.Uuid
+  order        Int
+
+  lesson     Lesson     @relation(fields: [lessonId], references: [id], onDelete: Cascade)
+  vocabulary Vocabulary @relation(fields: [vocabularyId], references: [id], onDelete: Restrict)
+
+  @@id([lessonId, vocabularyId])
+  @@index([lessonId, order])
+}
+
+model LessonGrammar {
+  lessonId  String @db.Uuid
+  grammarId String @db.Uuid
+  order     Int
+
+  lesson  Lesson  @relation(fields: [lessonId], references: [id], onDelete: Cascade)
+  grammar Grammar @relation(fields: [grammarId], references: [id], onDelete: Restrict)
+
+  @@id([lessonId, grammarId])
+  @@index([lessonId, order])
+}
+
+model LessonKanji {
+  lessonId String @db.Uuid
+  kanjiId  String @db.Uuid
+  order    Int
+
+  lesson Lesson @relation(fields: [lessonId], references: [id], onDelete: Cascade)
+  kanji  Kanji  @relation(fields: [kanjiId], references: [id], onDelete: Restrict)
+
+  @@id([lessonId, kanjiId])
+  @@index([lessonId, order])
+}
+
+model Exercise {
+  id String @id @default(uuid(7)) @db.Uuid
+
+  lessonId String @db.Uuid
+
+  type        ExerciseType
+  prompt      String       @db.Text
+  explanation String?      @db.Text
+
+  // Author-assigned 1-5. Validated by the exercise service rather than trusted
+  // from an authoring form.
+  difficulty Int @default(1)
+
+  order  Int
+  status ContentStatus @default(DRAFT)
+
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  lesson Lesson @relation(fields: [lessonId], references: [id], onDelete: Cascade)
+
+  options  ExerciseOption[]
+  attempts ExerciseAttempt[]
+
+  @@unique([lessonId, order])
+}
+
+model ExerciseOption {
+  id String @id @default(uuid(7)) @db.Uuid
+
+  exerciseId String @db.Uuid
+
+  label String @db.Text
+
+  // SECURITY: the answer key. This column must never be selected into any value
+  // handed to a client component or returned by a student-facing route;
+  // `features/learning` selects options with an explicit projection so the key
+  // cannot leak by accident when the model grows (AGENTS.md section 8).
+  isCorrect Boolean @default(false)
+
+  order Int
+
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+
+  exercise Exercise @relation(fields: [exerciseId], references: [id], onDelete: Cascade)
+
+  attempts ExerciseAttempt[]
+
+  @@unique([exerciseId, order])
+}
+
+// Append-only record of one graded answer.
+//
+// `isCorrect` here is an immutable historical fact, not a cache of
+// `ExerciseOption.isCorrect`: if an author later fixes the answer key, past
+// attempts must not silently re-grade themselves. Lesson scores are therefore
+// derived from these stored outcomes rather than by re-grading current content.
+model ExerciseAttempt {
+  id String @id @default(uuid(7)) @db.Uuid
+
+  userId     String @db.Uuid
+  exerciseId String @db.Uuid
+  // Denormalized from the exercise so a lesson's score is one indexed range scan
+  // instead of a join across every exercise in the course.
+  lessonId   String @db.Uuid
+
+  isCorrect Boolean
+
+  // Which option the learner chose. `SetNull` so removing an option from an edit
+  // does not delete the attempt, while the relation stays explicit.
+  givenOptionId String? @db.Uuid
+
+  // 1-based retry counter per learner per exercise. Unique with the other keys
+  // so two concurrent submissions cannot claim the same number.
+  attemptNumber Int
+
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+
+  user        User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  exercise    Exercise        @relation(fields: [exerciseId], references: [id], onDelete: Restrict)
+  lesson      Lesson          @relation(fields: [lessonId], references: [id], onDelete: Cascade)
+  givenOption ExerciseOption? @relation(fields: [givenOptionId], references: [id], onDelete: SetNull)
+
+  @@unique([exerciseId, userId, attemptNumber])
+  @@index([userId, createdAt])
+  @@index([lessonId])
+}
+
+// Append-only record that a learner finished a lesson. The composite unique key
+// makes completion idempotent, so a double-submitted form cannot inflate the
+// number of completed lessons (AGENTS.md section 10: avoid duplicate progress
+// events).
+model LessonCompletion {
+  id String @id @default(uuid(7)) @db.Uuid
+
+  userId   String @db.Uuid
+  lessonId String @db.Uuid
+
+  completedAt DateTime @default(now()) @db.Timestamptz(3)
+
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  lesson Lesson @relation(fields: [lessonId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, lessonId])
+  @@index([userId, completedAt])
+}
